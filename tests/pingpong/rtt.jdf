@@ -1,0 +1,24 @@
+extern "C" %{
+   /* This simple example does not need to include anything */
+%}
+
+NT
+WS
+
+PING(k)
+
+k = 0 .. NT-1
+: A(k % WS)
+
+RW T <- (k ==0) ? A(k % WS) : T PING(k-1)
+     -> (k< NT) ? T PING(k+1)
+     -> A(k % WS)
+
+; 0
+
+BODY
+	/* 
+	int r; MPI_Comm_rank(MPI_COMM_WORLD, &r);
+	printf("%d: PING(%d)\n", r, k);
+ 	*/
+END

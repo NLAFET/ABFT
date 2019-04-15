@@ -1,0 +1,185 @@
+extern "C" %{
+
+/**
+ * This example illustrates the Read After Write problem that might happen when anti-dependencies are present in the code
+ * Each process broadcast an information to NB/2 tasks, and to a local task that updates the information.
+ */
+
+#include "parsec.h"
+
+%}
+
+mydata  [ type="parsec_data_collection_t*" ]
+nodes   [ type="int" ]
+rank    [ type="int" ]
+NB      [ type="int" hidden=on default="(6)" ]
+
+TaskBcast(k)
+
+k = 0 .. %{ return nodes-1; %}
+
+: mydata( k )
+
+RW  A <- mydata( k )
+      -> A TaskUpdate( k )
+      -> A TaskRecv( k, 0 .. NB .. 2 )
+
+BODY
+{
+    int *Aint = (int*)A;
+    *Aint = k+1;
+
+    printf("[%d] Send %d\n", rank, k );
+}
+END
+
+
+TaskRecv(k, n)
+
+k = 0 .. %{ return nodes-1; %}
+n = 0 .. NB .. 2
+loc = %{ return k + n; %}
+
+: mydata( loc )
+
+READ A <- A TaskBcast( k )
+
+/**
+ * We had a control flow, to tell the engine this task must be done before
+ * TaskUpdate( k )
+ */
+CTL ctl -> ctl TaskUpdate( k )
+
+BODY
+{
+    int *Aint = (int*)A;
+    printf("[%d] Recv %d\n", rank, *Aint );
+}
+END
+
+TaskUpdate(k)
+
+k = 0 .. %{ return nodes-1; %}
+
+: mydata( k )
+
+RW  A <- A TaskBcast(k)
+      -> mydata( k )
+
+/**
+ * We wait for all tasks that are using this data to be done with it before writing
+ */
+CTL ctl <- ctl TaskRecv( k, 0 .. NB .. 2 )
+
+BODY
+{
+    int *Aint = (int*)A;
+    *Aint = -k-1;
+}
+END
+
+
+extern "C" %{
+
+static uint32_t
+rank_of(parsec_data_collection_t *desc, ...)
+{
+    int k;
+    va_list ap;
+
+    va_start(ap, desc);
+    k = va_arg(ap, int);
+    va_end(ap);
+
+    return k % desc->nodes;
+}
+
+static int32_t
+vpid_of(parsec_data_collection_t *desc, ...)
+{
+    (void)desc;
+    return 0;
+}
+
+static parsec_data_key_t
+data_key(parsec_data_collection_t *desc, ...)
+{
+    int k;
+    va_list ap;
+    (void)desc;
+    va_start(ap, desc);
+    k = va_arg(ap, int);
+    va_end(ap);
+    return (uint64_t)k;
+}
+
+static parsec_data_t *ddata_mycounter = NULL;
+
+static parsec_data_t *
+data_of(parsec_data_collection_t *desc, ...)
+{
+    (void)desc;
+    return ddata_mycounter;
+}
+
+int main(int argc, char *argv[])
+{
+    parsec_context_t* parsec;
+    int rc;
+    int rank, world;
+    parsec_data_collection_t mydata;
+    parsec_Ex07_RAW_CTL_taskpool_t *tp;
+    int mycounter;
+
+#if defined(PARSEC_HAVE_MPI)
+    {
+        int provided;
+        MPI_Init_thread(&argc, &argv, MPI_THREAD_SERIALIZED, &provided);
+    }
+    MPI_Comm_size(MPI_COMM_WORLD, &world);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+#else
+    world = 1;
+    rank = 0;
+#endif
+
+    parsec = parsec_init(-1, &argc, &argv);
+
+    mycounter = 300 + rank;
+    ddata_mycounter = parsec_data_create(
+        &ddata_mycounter, &mydata, 0,
+        &mycounter, sizeof(int));
+
+    parsec_data_collection_init(&mydata, world, rank);
+    mydata.rank_of = rank_of;
+    mydata.vpid_of = vpid_of;
+    mydata.data_key = data_key;
+    mydata.data_of = data_of;
+
+    tp = parsec_Ex07_RAW_CTL_new(&mydata, world, rank);
+
+    parsec_arena_construct(tp->arenas[PARSEC_Ex07_RAW_CTL_DEFAULT_ARENA],
+                          sizeof(int), PARSEC_ARENA_ALIGNMENT_SSE,
+                          parsec_datatype_int_t );
+
+    rc = parsec_context_add_taskpool( parsec, (parsec_taskpool_t*)tp );
+    PARSEC_CHECK_ERROR(rc, "parsec_context_add_taskpool");
+    rc = parsec_context_start(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_start");
+    rc = parsec_context_wait(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_wait");
+
+    parsec_taskpool_free((parsec_taskpool_t*)tp);
+
+    parsec_data_destroy( ddata_mycounter );
+    parsec_data_collection_destroy( &mydata );
+
+    parsec_fini(&parsec);
+#if defined(PARSEC_HAVE_MPI)
+    MPI_Finalize();
+#endif
+
+    return 0;
+}
+
+%}

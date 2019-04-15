@@ -1,0 +1,466 @@
+extern "C" %{
+/*
+ * Copyright (c) 2010-2018 The University of Tennessee and The University
+ *                         of Tennessee Research Foundation.  All rights
+ *                         reserved.
+ * Copyright (c) 2013      Inria. All rights reserved.
+ *
+ * @precisions normal z -> s d c
+ *
+ */
+#include "dplasma/lib/dplasmajdf.h"
+#include "parsec/data_dist/matrix/matrix.h"
+
+#if defined(PARSEC_HAVE_CUDA)
+#include <cublas.h>
+#endif  /* defined(PARSEC_HAVE_CUDA) */
+
+#include <math.h>
+
+#define DO_ERROR
+
+/*
+ * Priorities used in this jdf:
+ *      - POTRF(k)    : (MT-k)**3
+ *      - HERK(k,m)   : (MT-m)**3 + 3 * (m - k)
+ *      - TRSM(m,k)   : (MT-m)**3 + 3 * (m - k) * (2 * MT - k - m - 1)
+ *      - GEMM(m,n,k) : (MT-m)**3 + 3 * (m - n) * (2 * MT - m - n - 1) + 6 * (m - k)
+ *
+ * So max priority is:
+ *      (MT - PRI_CHANGE)**3 + 3 * MT * (2 * MT - PRI_CHANGE - 1) + 6 * MT  < (MT**3 + 6 MT**2 + 3 MT)
+ *
+ * WARNING: If mt is greater than 1200, we might get integer overflow.
+ */
+
+%}
+
+/* Globals
+ */
+uplo       [type = PLASMA_enum]
+descA      [type = "parsec_tiled_matrix_dc_t*"]
+INFO       [type = "int*"]
+pv [type = "parsec_memory_pool_t *" size = "(sizeof(parsec_complex64_t)*(descA->nb-2))"]
+pint_v [type = "parsec_memory_pool_t *" size = "(sizeof(parsec_complex64_t)*(descA->nb-2))"]
+py [type = "parsec_memory_pool_t *" size = "(sizeof(parsec_complex64_t)*(descA->nb-2))"]
+pint_y [type = "parsec_memory_pool_t *" size = "(sizeof(parsec_complex64_t)*(descA->nb-2))"]
+
+PRI_CHANGE [type = "int" hidden = on default = 0 ]
+PRI_MAX    [type = "int" hidden = on default = "(descA->mt * ( 3 + descA->mt * ( 2 + descA->mt )))" ]
+
+/**************************************************
+ *                      POTRF                     *
+ **************************************************/
+POTRF(k) [high_priority = on]
+
+// Execution space
+k = 0 .. descA->mt-1
+
+// Parallel partitioning
+:descA(k, k)
+
+// Parameters
+RW T <- (k == 0) ? descA(k, k) : T HERK(k-1, k)
+     -> T TRSM(k+1..descA->mt-1, k)
+     -> descA(k, k)
+
+; (k >= (descA->mt - PRI_CHANGE)) ? (descA->mt - k) * (descA->mt - k) * (descA->mt - k) : PRI_MAX
+
+BODY
+{
+    int tempkm = k == descA->mt-1 ? descA->m - k*descA->mb : descA->mb;
+    int iinfo = 0;
+    int ldak = BLKLDD( descA, k );
+
+#if !defined(PARSEC_DRY_RUN)
+    CORE_zpotrf( uplo, tempkm, T, ldak, &iinfo );
+    if ( iinfo != 0 && *INFO == 0 )
+        *INFO = k*descA->mb+iinfo; /* Should return here */
+
+#if defined DO_ERROR
+    /*
+        if(k == (descA->mt-1)/2) {
+            *((parsec_complex64_t*)(T) + (4 + 2*ldak)) += (parsec_complex64_t)1.0;
+        }
+     */
+#endif
+
+    /* Checksum verification*/
+    parsec_complex64_t *v = parsec_private_memory_pop(pv);
+    parsec_complex64_t *int_v = parsec_private_memory_pop(pint_v);
+    for(int ii=0;ii<tempkm-2;ii++){
+        v[ii] = (parsec_complex64_t)1.0;
+        int_v[ii] = (parsec_complex64_t)(1.0*(ii+1));
+    }
+
+    cblas_ztrmv(CblasColMajor, CblasLower, CblasConjTrans, CblasNonUnit,
+                tempkm-2, T, ldak,
+                v, 1);
+#if defined(PRECISION_d)
+    /*  Validation code.
+        printf("\n");
+        for(int ii=0;ii<tempkm-2;ii++)
+            printf("%f   %f\t", v[ii], ((double*)T)[tempkm-2+ldak*ii]);
+        printf("\n");
+     */
+#endif
+
+    parsec_complex64_t zmone = -1.;
+    cblas_zaxpy(tempkm-2, CBLAS_SADDR(zmone), (parsec_complex64_t*)(T)+(tempkm-2), ldak, v, 1);
+
+#if defined(PRECISION_d) || defined(PRECISION_s)
+    int length = tempkm-2;
+    for(int ii=0;ii<tempkm-2;ii++){
+        if(fabs(v[ii]) > length*(1.0e-9)){
+            cblas_ztrmv(CblasColMajor, CblasLower, CblasConjTrans, CblasNonUnit,
+                        tempkm-2, T, ldak,
+                        int_v, 1);
+            parsec_complex64_t var_ii = int_v[ii] - *((parsec_complex64_t*)(T)+(tempkm-1)+ii*ldak);
+            int jj = (int)(var_ii/v[ii]+0.5);
+            /* Recovery */
+            *((parsec_complex64_t*)(T) + (jj-1 + ii*ldak)) -= v[ii]; 
+        }
+    }
+#endif
+
+    parsec_private_memory_push( pv,  v );
+    parsec_private_memory_push( pint_v, int_v );
+
+    /* Verification end*/
+
+#endif /* !defined(PARSEC_DRY_RUN) */
+
+    printlog( "CORE_zpotrf( %d )\n\t( %s, %d, A(%d,%d)[%p], %d) return info = %d\n",
+             k,
+             plasma_const(uplo), tempkm, k, k, T, descA->mb, iinfo );
+}
+END
+
+
+/**************************************************
+ *                      TRSM                      *
+ **************************************************/
+TRSM(m, k) [high_priority = on]
+
+// Execution space
+m = 1 .. descA->mt-1
+k = 0 .. m-1
+
+// Parallel partitioning
+: descA(m, k)
+
+// Parameters
+READ  T <- T POTRF(k)
+RW    C <- (k == 0) ? descA(m, k) : C GEMM(m, k, k-1)
+        -> A HERK(k, m)
+        -> A GEMM(m, k+1..m-1, k)
+        -> B GEMM(m+1..descA->mt-1, m, k)
+        -> descA(m, k)
+
+; (m >= (descA->mt - PRI_CHANGE)) ? (descA->mt - m) * (descA->mt - m) * (descA->mt - m) + 3 * ((2 * descA->mt) - k - m - 1) * (m - k) : PRI_MAX
+
+BODY
+{
+    int tempmm = m == descA->mt-1 ? descA->m - m * descA->mb : descA->mb;
+    int ldak = BLKLDD( descA, k );
+    int ldam = BLKLDD( descA, m );
+
+#if !defined(PARSEC_DRY_RUN)
+    CORE_ztrsm(PlasmaRight, PlasmaLower, PlasmaConjTrans, PlasmaNonUnit,
+               tempmm, descA->nb-2,
+               (parsec_complex64_t)1.0, T /*A(k, k)*/, ldak,
+                                        C /*A(m, k)*/, ldam);
+#if defined DO_ERROR
+    /*
+        if(k == 0 && m == 3){
+            *((parsec_complex64_t*)(C) + (4 + 2*ldak)) += (parsec_complex64_t)1.0;
+        }
+    */
+#endif
+
+    /* Checksum verification*/
+    parsec_complex64_t *v = parsec_private_memory_pop(pv);
+    parsec_complex64_t *int_v = parsec_private_memory_pop(pint_v);
+    parsec_complex64_t *y = parsec_private_memory_pop(py);
+    parsec_complex64_t *int_y = parsec_private_memory_pop(pint_y);
+    for(int ii=0;ii<tempmm-2;ii++) {
+        v[ii] = (parsec_complex64_t)1.0;
+        int_v[ii] = (parsec_complex64_t)(1.0*(ii+1));
+    }
+
+    CORE_zgemv(PlasmaTrans, tempmm-2, descA->nb-2, 
+                (parsec_complex64_t)1.0, C, ldam,
+                v, 1,
+                (parsec_complex64_t)0.0, y, 1);
+
+    parsec_complex64_t zmone = -1.;
+    cblas_zaxpy(descA->nb-2, CBLAS_SADDR(zmone), (parsec_complex64_t*)(C)+(tempmm-2), ldam, y, 1);
+
+#if defined(PRECISION_d) || defined(PRECISION_s)
+    int length = tempmm-2;
+    for(int ii=0;ii<tempmm-2;ii++){
+        if(fabs(y[ii]) > length*(1.0e-9)){
+            CORE_zgemv(PlasmaTrans, tempmm-2, descA->nb-2,
+                       (parsec_complex64_t)1.0, C, ldam,
+                       int_v, 1,
+                       (parsec_complex64_t)0.0, int_y, 1);
+            parsec_complex64_t var_ii = int_y[ii] - *((parsec_complex64_t*)(C)+(tempmm-1)+ii*ldam);
+            int jj = (int)(var_ii/y[ii]+0.5);
+            /* Recovery */
+            *((parsec_complex64_t*)(C) + (jj-1 + ii*ldam)) -= y[ii]; 
+        }
+    }
+#endif
+
+    parsec_private_memory_push( pv,  v );
+    parsec_private_memory_push( pint_v, int_v );
+    parsec_private_memory_push( py,  y );
+    parsec_private_memory_push( pint_y, int_y );
+    /* Verification end*/
+
+#endif  /* !defined(PARSEC_DRY_RUN) */
+
+    printlog("CORE_ztrsm( %d, %d )\n\t( %s, %s, %s, %s, %d, %d, %f, A(%d,%d)[%p], %d,  A(%d,%d)[%p], %d)\n",
+             m, k,
+             plasma_const( PlasmaRight ), plasma_const( PlasmaLower ),
+             plasma_const( PlasmaConjTrans ), plasma_const( PlasmaNonUnit ),
+             tempmm, descA->nb,
+             1.0, k, k, T, ldak,
+                  m, k, C, ldam);
+}
+END
+
+
+/**************************************************
+ *                      HERK                      *
+ **************************************************/
+HERK(k, m) [high_priority = on]
+
+// Execution space
+k = 0   .. descA->mt-2
+m = k+1 .. descA->mt-1
+
+// Parallel partitioning
+: descA(m, m)
+
+//Parameters
+READ  A <- C TRSM(m, k)
+RW    T <- (k == 0)   ? descA(m, m) : T HERK(k-1, m)
+        -> (m == k+1) ? T POTRF(m)  : T HERK(k+1, m)
+
+; (m >= (descA->mt - PRI_CHANGE)) ? (descA->mt - m) * (descA->mt - m) * (descA->mt - m) + 3 * (m - k) : PRI_MAX
+
+BODY
+{
+    int tempmm = m == descA->mt-1 ? descA->m - m*descA->mb : descA->mb;
+    int ldam = BLKLDD( descA, m );
+
+#if !defined(PARSEC_DRY_RUN)
+
+    //CORE_zherk(PlasmaLower, PlasmaNoTrans,
+    //           tempmm, descA->mb-2,
+    //           (double)-1.0, A /*A(m, k)*/, ldam,
+    //           (double) 1.0, T /*A(m, m)*/, ldam);
+
+    CORE_zgemm(PlasmaNoTrans, PlasmaConjTrans,
+               tempmm, tempmm-2, descA->mb-2,
+               (double)-1.0, A /*A(m, k)*/, ldam,
+                             A /*A(m, k)*/, ldam,
+               (double) 1.0, T /*A(m, m)*/, ldam);
+
+#if defined DO_ERROR
+    /*
+        if(k == 1 && m == 2){
+            *((parsec_complex64_t*)(T) + (3 + 2*ldam)) += (parsec_complex64_t)1.0;
+        }
+    */
+#endif
+    /* Checksum verification*/
+    parsec_complex64_t *v = parsec_private_memory_pop(pv);
+    parsec_complex64_t *int_v = parsec_private_memory_pop(pint_v);
+    parsec_complex64_t *y = parsec_private_memory_pop(py);
+    parsec_complex64_t *int_y = parsec_private_memory_pop(pint_y);
+    for(int ii=0;ii<tempmm-2;ii++){
+        v[ii] = (parsec_complex64_t)1.0;
+        int_v[ii] = (parsec_complex64_t)(1.0*(ii+1));
+    }
+
+    CORE_zgemv(PlasmaTrans, tempmm-2, tempmm-2,
+               (parsec_complex64_t)1.0, T, ldam,
+               v, 1,
+               (parsec_complex64_t)0.0, y, 1);
+
+#if defined(PRECISION_d)
+    /*
+        printf("\n");
+        for(int ii=0;ii<tempkm-1;ii++)
+            printf("%f   %f\t", v[ii], ((double*)T)[tempkm-1+ldak*ii]);
+        printf("\n");
+     */
+#endif
+
+    parsec_complex64_t zmone = -1.;
+    cblas_zaxpy(tempmm-2, CBLAS_SADDR(zmone), (parsec_complex64_t*)(T)+(tempmm-2), ldam, y, 1);
+
+#if defined(PRECISION_d) || defined(PRECISION_s)
+    int length = tempmm-2;
+    for(int ii=0;ii<tempmm-2;ii++){
+        if(fabs(y[ii]) > length*(1.0e-9)){
+            CORE_zgemv(PlasmaTrans, tempmm-2, descA->nb-2,
+                       (parsec_complex64_t)1.0, T, ldam,
+                       int_v, 1,
+                       (parsec_complex64_t)0.0, int_y, 1);
+            parsec_complex64_t var_ii = int_y[ii] - *((parsec_complex64_t*)(T)+(tempmm-1)+ii*ldam);
+            int jj = (int)(var_ii/y[ii]+0.5);
+            /* Recovery */
+            *((parsec_complex64_t*)(T) + (jj-1 + ii*ldam)) -= y[ii];
+        }
+    }
+#endif
+    parsec_private_memory_push( pv,  v );
+    parsec_private_memory_push( pint_v, int_v );
+    parsec_private_memory_push( py,  y );
+    parsec_private_memory_push( pint_y, int_y );
+    /* Verification end*/
+
+#endif  /* !defined(PARSEC_DRY_RUN) */
+    printlog("CORE_zherk( %d, %d )\n\t( %s, %s, %d, %d, %f, A(%d,%d)[%p], %d, %f, A(%d,%d)[%p], %d)\n",
+             k, m,
+             plasma_const( PlasmaLower ), plasma_const( PlasmaNoTrans ),
+             tempmm, descA->mb,
+             -1.0, m, k, A, ldam,
+              1.0, m, m, T, ldam);
+}
+END
+
+/**************************************************
+ *                      GEMM                      *
+ **************************************************/
+// Name
+GEMM(m, n, k)
+
+// Execution space
+k = 0   .. descA->mt-3
+m = k+2 .. descA->mt-1
+n = k+1 .. m-1
+
+// Parallel partitioning
+: descA(m, n)
+
+// Parameters
+READ  A <- C TRSM(m, k)
+READ  B <- C TRSM(n, k)
+RW    C <- (k == 0)   ? descA(m, n)  : C GEMM(m, n, k-1)
+        -> (n == k+1) ? C TRSM(m, n) : C GEMM(m, n, k+1)
+
+; (m >= (descA->mt - PRI_CHANGE)) ? (descA->mt - m) * (descA->mt - m) * (descA->mt - m) + 3 * ((2 * descA->mt) - m - n - 3) * (m - n) + 6 * (m - k) : PRI_MAX
+
+BODY [type=CUDA
+      dyld=cublasZgemm dyldtype=cublas_zgemm_t
+      weight=(n+1-k)]
+{
+#if defined(PRECISION_z) || defined(PRECISION_c)
+    cuDoubleComplex zone  = make_cuDoubleComplex( 1., 0.);
+    cuDoubleComplex mzone = make_cuDoubleComplex(-1., 0.);
+#else
+    double zone  =  1.;
+    double mzone = -1.;
+#endif
+
+    int tempmm = m == descA->mt-1 ? descA->m - m * descA->mb : descA->mb;
+    int ldam = BLKLDD( descA, m );
+    int ldan = BLKLDD( descA, n );
+
+    cublasStatus_t status;
+    assert( ldan <= descA->mb );
+    assert( ldam <= descA->mb );
+
+    cublasSetKernelStream( parsec_body.stream );
+    parsec_body.dyld_fn( 'N', lapack_const(PlasmaConjTrans),
+             tempmm, descA->mb, descA->mb,
+             mzone, (cuDoubleComplex*)A, ldam,
+                    (cuDoubleComplex*)B, ldan,
+             zone,  (cuDoubleComplex*)C, ldam );
+    status = cublasGetError();
+    PARSEC_CUDA_CHECK_ERROR( "cublasZgemm ", status,
+                            {return -1;} );
+}
+END
+
+BODY
+{
+    int tempmm = m == descA->mt-1 ? descA->m - m * descA->mb : descA->mb;
+    int ldam = BLKLDD( descA, m );
+    int ldan = BLKLDD( descA, n );
+
+#if !defined(PARSEC_DRY_RUN)
+    CORE_zgemm(PlasmaNoTrans, PlasmaConjTrans,
+               tempmm, descA->mb-2, descA->mb-2,
+               (double)-1.0, A /*A(m, k)*/, ldam,
+                             B /*A(n, k)*/, ldan,
+               (double) 1.0, C /*A(m, n)*/, ldam);
+
+#if defined DO_ERROR
+    if(k == (descA->mt-1)/2 && m == (descA->mt-1)/2+2 && n == (descA->mt-1)/2+1){
+        *((parsec_complex64_t*)(C) + (2 + 2*ldam)) += (parsec_complex64_t)1.0;
+    }
+#endif
+
+    /* Checksum verification*/
+    parsec_complex64_t *v = parsec_private_memory_pop(pv);
+    parsec_complex64_t *int_v = parsec_private_memory_pop(pint_v);
+    parsec_complex64_t *y = parsec_private_memory_pop(py);
+    parsec_complex64_t *int_y = parsec_private_memory_pop(pint_y);
+    for(int ii=0;ii<tempmm-2;ii++){
+        v[ii] = (parsec_complex64_t)1.0;
+        int_v[ii] = (parsec_complex64_t)(1.0*(ii+1));
+    }
+
+    CORE_zgemv(PlasmaTrans, tempmm-2, descA->mb-2, 
+                (double)1.0, C, ldam, 
+                v, 1,
+                (double)0.0, y, 1);
+
+#if defined(PRECISION_d)
+        /*
+        printf("\n");
+        for(int ii=0;ii<tempkm-1;ii++)
+            printf("%f   %f\t", v[ii], ((double*)T)[tempkm-1+ldak*ii]);
+        printf("\n");
+        */
+#endif
+
+    parsec_complex64_t zmone = -1.;
+    cblas_zaxpy(descA->mb-2, CBLAS_SADDR(zmone), (parsec_complex64_t*)(C)+(tempmm-2), ldam, y, 1);
+
+#if defined(PRECISION_d) || defined(PRECISION_s)
+    int length = tempmm-2;
+    for(int ii=0;ii<tempmm-2;ii++){
+        if(fabs(y[ii]) > length*(1.0e-9)){
+            CORE_zgemv(PlasmaTrans, tempmm-2, descA->mb-2,
+                (parsec_complex64_t)1.0, C, ldam, 
+                int_v, 1, 
+                (parsec_complex64_t)0.0, int_y, 1);
+            parsec_complex64_t var_ii = int_y[ii] - *((parsec_complex64_t*)(C)+(tempmm-1)+ii*ldam);
+            int jj = (int)(var_ii/y[ii]+0.5);
+            /* Recovery */
+            *((parsec_complex64_t*)(C) + (jj-1 + ii*ldam)) -= y[ii];
+        }
+    }
+#endif
+    parsec_private_memory_push( pv,  v );
+    parsec_private_memory_push( pint_v, int_v );
+    parsec_private_memory_push( py,  y );
+    parsec_private_memory_push( pint_y, int_y );
+    /* Verification end*/
+
+#endif  /* !defined(PARSEC_DRY_RUN) */
+
+    printlog("CORE_zgemm( %d, %d, %d )\n\t( %s, %s, %d, %d, %d, %f, A(%d,%d)[%p], %d, A(%d,%d)[%p], %d, %f, A(%d,%d)[%p], %d)\n",
+             m, n, k,
+             plasma_const( PlasmaNoTrans ),  plasma_const( PlasmaConjTrans ),
+             tempmm, descA->mb, descA->mb,
+             -1.0, m, k, A, ldam,
+                   n, k, B, ldan,
+              1.0, m, n, C, ldam);
+}
+END

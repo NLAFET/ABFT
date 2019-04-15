@@ -1,0 +1,43 @@
+extern "C" %{
+/*
+ * Copyright (c) 2011-2016 The University of Tennessee and The University
+ *                         of Tennessee Research Foundation.  All rights
+ *                         reserved.
+ */
+
+#include <math.h>
+#include "parsec/data_dist/matrix/matrix.h"
+
+%}
+
+descA                [type = "parsec_tiled_matrix_dc_t*"]
+R                    [type = "parsec_tiled_matrix_dc_t*"]
+MT                   [type = int
+                      hidden = on
+                      default="descA->mt"]
+depth                [type = int
+                      hidden = on
+                      default = "(int)ceil(log(descA->mt) / log(2.0))"]
+ELEM_NEUTRE          [type = "void*"]
+
+reduce(l, p)
+  l = 1 .. depth+1
+  p = 0 .. (MT / (1<<l))
+
+  : descA(p,0)
+
+  READ A  <- (1 == l) ? descA(2*p, 0) : C reduce( l - 1, 2 * p )
+  READ B  <- ((p * (1 << l) + (1 << (l-1))) >=  MT)  ? NULL
+          <- ((1 == l) & ((p * (1 << l) + (1 << (l-1)) < MT))) ? descA(2*p+1,0)
+          <- ((1 != l) & ((p * (1 << l) + (1 << (l-1)) < MT))) ? C reduce(l - 1, p * 2 + 1)
+  WRITE C <- NEW  [type = DEFAULT]
+          -> ((depth+1) == l) ? R(p, 0)
+          -> (((depth+1) != l) & (0 == (p%2))) ? A reduce(l+1, p/2)
+          -> (((depth+1) != l) & (0 != (p%2))) ? B reduce(l+1, p/2)
+BODY
+  printf( "reduce(level = %d, process = %d) %d %d (p [%d .. %d])\n",
+          l, p, p * (1 << l), p * (1 << l) + (1 << (l-1)), 0, (MT / (1<<l)) );
+END
+extern "C" %{
+
+%}

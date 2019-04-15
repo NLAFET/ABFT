@@ -1,0 +1,132 @@
+extern "C" %{
+/*
+ * Copyright (c) 2011-2018 The University of Tennessee and The University
+ *                         of Tennessee Research Foundation.  All rights
+ *                         reserved.
+ */
+
+#include "parsec/parsec_config.h"
+#include "parsec/parsec_internal.h"
+#include "parsec/data_dist/matrix/matrix.h"
+#include "parsec/data_dist/matrix/two_dim_rectangle_cyclic.h"
+#include "parsec/data_dist/matrix/sym_two_dim_rectangle_cyclic.h"
+
+#include <string.h>
+
+/***********************************************************
+ * Convert a tiled 2D cyclic symetric band diagonal matrix *
+ * into a 1D cyclic rectangle                              *
+ ***********************************************************/
+
+%}
+
+descA  [type = "sym_two_dim_block_cyclic_t*"]
+descB  [type = "two_dim_block_cyclic_t*"]
+MT  [type = int]
+NT  [type = int]
+MB  [type = int]
+NB  [type = int]
+TY  [type = size_t]
+
+convert_diag(k)
+
+k = 0 .. NT
+
+: descB(0,k)
+
+RO  D   <- (k < NT)     ? A read_diag(k)    : descB(0,k)
+RO  SD  <- (k < NT-1)   ? A read_subdiag(k) : descB(0,k)
+RW  B   <- descB(0,k)
+        -> descB(0,k)
+
+BODY
+    int j;
+    char* b  = B;
+    char* d  = D;
+    char* sd = SD;
+    int  BNB = NB+2;
+    int  BMB = MB+1;
+
+#ifdef PARSEC_CALL_TRACE
+    fprintf(stderr, "convert_diag( %d )\n", k);
+#endif
+
+    assert(MB == NB);
+    if(k == NT)
+    {
+        /* Check if the output matrix has size for padding */
+        if(descB->super.n == (NT+1)*BNB)
+        {
+            /*
+            for(j = 0; j < NB+2; j++) for(i = 0; i < MB+1; i++)
+                B[j*(NB+2)+i] = 0e0;
+            */
+            memset(b, 0, TY* BNB*BMB);
+        }
+        else
+        {
+            assert(descB->super.n == NT*BNB);
+        }
+    }
+    else
+    {
+        for(j = 0; j < NB; j++)
+        {
+            /*
+            for(i = 0; i < MB-j; i++)
+                B[j*BMB+i] = D[j*MB+j+i];
+            */
+            memcpy(b+TY* (j*BMB), d+TY* (j*MB+j), TY* (MB-j));
+            if(k == NT-1) {
+                /*
+                for(i = MB-j; i < MB+1; i++)
+                    B[j*BMB+i] = 0e0;
+                */
+                memset(b+TY* (j*BMB+MB-j), 0, TY* (j+1));
+            }
+            else {
+                /*
+                for(i = MB-j; i < MB+1; i++)
+                    B[j*BMB+i] = SD[j*MB+i-(MB-j)];
+                */
+                memcpy(b+TY* (j*BMB+MB-j), sd+TY* (j*MB), TY* (j+1));
+            }
+        }
+        for(j = NB; j < NB+2; j++) {
+            memset(b+TY* (j*BMB), 0, TY* BMB);
+        }
+    }
+END
+
+read_diag(k)
+
+k = 0 .. NT-1
+
+: descA(k,k)
+
+RO  A <- descA(k,k)
+      -> D convert_diag(k)
+
+BODY
+#ifdef PARSEC_CALL_TRACE
+    fprintf(stderr, "read_diag( %d )\n", k);
+#endif
+    /*nothing*/
+END
+
+read_subdiag(k)
+
+k = 0 .. NT-2
+
+: descA(k+1,k)
+
+RO  A <- descA(k+1,k)
+      -> SD convert_diag(k)
+
+BODY
+#ifdef PARSEC_CALL_TRACE
+    fprintf(stderr, "read_subdiag( %d )\n", k);
+#endif
+    /*nothing*/
+END
+

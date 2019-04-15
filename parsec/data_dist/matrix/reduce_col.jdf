@@ -1,0 +1,69 @@
+extern "C" %{
+/*
+ * Copyright (c) 2011-2016 The University of Tennessee and The University
+ *                         of Tennessee Research Foundation.  All rights
+ *                         reserved.
+ */
+
+#include <math.h>
+#include "parsec/runtime.h"
+#include "parsec/data_dist/matrix/matrix.h"
+%}
+
+depth      [type = int
+            hidden = on
+            default = "(int)ceil(log(src->mt) / log(2.0))"] // height of the reduction tree
+src        [type = "const parsec_tiled_matrix_dc_t*"]
+dest       [type = "parsec_tiled_matrix_dc_t*"
+            aligned = src]
+operator   [type = parsec_operator_t]
+op_data    [type = "void*"]
+IA         [type = int]
+JA         [type = int]
+M          [type = int]
+N          [type = int]
+
+/**************************************************
+ * Reduction by column                            *
+ **************************************************/
+reduce_in_col( row, col )  [profile = off]
+    row = IA .. M
+    col = JA .. N
+
+    : src( row, col )
+
+    READ  Rtop <- src(row, col)
+               -> ((row % 2) == 0)
+                    ? Rtop    reduce_col( 1, row / 2, col )
+                    : Rbottom reduce_col( 1, row / 2, col )
+BODY
+    /* Just the input task */
+END
+
+reduce_col( level, index, col )
+    level = 1 .. depth
+    index = 0 .. ((1 << (depth - level)) - 1)
+    col = JA .. N
+
+    : src( 2 * index, 0 )
+
+    READ     Rbottom <- (level == 1)
+                        ? Rtop    reduce_in_col( (2 * index) + 1, col )
+                        : Rtop    reduce_col(level - 1, (2 * index) + 1, col)
+
+    RW       Rtop    <- (level == 1)
+                        ? Rtop    reduce_in_col( 2 * index, col )
+                        : Rtop    reduce_col( level - 1, 2 * index, col )
+
+                     -> (0 == (index % 2))
+                        ? Rtop    reduce_col( level + 1, index / 2, col )
+
+                     -> (1 == (index % 2))
+                        ? Rbottom reduce_col( level + 1, index / 2, col )
+
+                     -> (level == depth)
+                        ? dest(col)
+BODY
+    printf( "reduce_col level: %i index: %i\n", level, index );
+END
+

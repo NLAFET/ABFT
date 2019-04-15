@@ -1,0 +1,217 @@
+extern "C" %{
+/**
+ * Copyright (c) 2013      The University of Tennessee and The University
+ *                         of Tennessee Research Foundation.  All rights
+ *                         reserved.
+ */
+
+#include "parsec/data_dist/matrix/two_dim_rectangle_cyclic.h"
+#include <sys/time.h>
+#include <inttypes.h>
+#include <string.h>
+#include <stdlib.h>
+
+#define BLOCK 10
+#define NN    10
+#define TYPE  matrix_RealFloat
+
+%}
+
+descA      [type = "two_dim_block_cyclic_t*"]
+NI         [type = int]
+NK         [type = int]
+
+FCT1(i, k)
+
+  i = 0 .. NI-1
+  k = 0 .. NK-1
+
+: descA(i, 0)
+
+    READ A <- (0 == k) ? descA(i, 0) : A FCT1(i, k-1)
+         -> (NK != k) ? A FCT1(i, k+1)
+         -> A FCT5(i, k)                         [displ = BLOCK]
+         RW   B <- (0 == k) ? descA(i, 0) : B FCT1(i, k-1)
+         -> A FCT2(i, k, k .. NK)                [displ = 0]
+         -> A FCT3(i, k, k .. NK)                [displ = BLOCK]
+         -> A FCT4(i, k)
+         -> (NK != k) ? B FCT1(i, k+1)
+
+BODY
+END
+
+FCT2(i, k, j)
+
+  i = 0 .. NI-1
+  k = 0 .. NK-1
+  j = k .. NK
+
+: descA(i, 0)
+
+  READ A <- B FCT1(i, k)
+         -> B FCT3(i, j, k)
+
+BODY
+END
+
+FCT3(i, k, j)
+
+  i = 0 .. NI-1
+  k = 0 .. NK-1
+  j = k .. NK
+
+: descA(i, 0)
+
+  READ A <- B FCT1(i, k)
+  READ B <- A FCT2(i, j, k)
+BODY
+END
+
+FCT4(i, k)
+
+  i = 0 .. NI-1
+  k = 0 .. NK-1
+
+: descA(i, 0)
+
+  READ A <- B FCT1(i, k)
+
+BODY
+END
+
+FCT5(i, k)
+
+  i = 0 .. NI-1
+  k = 0 .. NK-1
+
+: descA(i, 0)
+
+  READ A <- A FCT1(i, k)
+
+BODY
+END
+
+extern "C" %{
+
+#define TIMER_START(TIMER)                      \
+    do {                                        \
+        struct timeval tv;                      \
+        gettimeofday(&tv,NULL);                 \
+        (TIMER) = tv.tv_sec * 1e6 + tv.tv_usec; \
+    } while (0)
+
+#define TIMER_STOP(TIMER)                                   \
+    do {                                                    \
+        struct timeval tv;                                  \
+        gettimeofday(&tv,NULL);                             \
+        (TIMER) = (tv.tv_sec * 1e6 + tv.tv_usec) - (TIMER); \
+    } while (0)
+
+int main( int argc, char** argv )
+{
+    parsec_complex_deps_taskpool_t* tp;
+    two_dim_block_cyclic_t descA;
+    parsec_arena_t arena;
+    parsec_datatype_t otype;
+    parsec_context_t *parsec;
+    int ni = NN, nk = NN, verbose = 0, i = 1, rc;
+    int rank = 0, size = 1, mat_size, cores = -1;
+    long time_elapsed;
+
+    while( NULL != argv[i] ) {
+        if( 0 == strncmp(argv[i], "-i=", 3) ) {
+            ni = strtol(argv[i]+3, NULL, 10);
+            goto move_and_continue;
+        }
+        if( 0 == strncmp(argv[i], "-k=", 3) ) {
+            nk = strtol(argv[i]+3, NULL, 10);
+            goto move_and_continue;
+        }
+        if( 0 == strncmp(argv[i], "-v=", 3) ) {
+            verbose = strtol(argv[i]+3, NULL, 10);
+            goto move_and_continue;
+        }
+        if( 0 == strncmp(argv[i], "-c=", 3) ) {
+            cores = strtol(argv[i]+3, NULL, 10);
+            goto move_and_continue;
+        }
+        i++;  /* skip this one */
+        continue;
+    move_and_continue:
+        memmove(&argv[i], &argv[i+1], (argc - 1) * sizeof(char*));
+        argc -= 1;
+    }
+#ifdef DISTRIBUTED
+    {
+        int provided;
+        MPI_Init_thread(NULL, NULL, MPI_THREAD_SERIALIZED, &provided);
+    }
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+#endif  /* DISTRIBUTED */
+    parsec = parsec_init(cores, &argc, &argv);
+    if( NULL == parsec ) {
+        exit(-1);
+    }
+
+    /**
+     * Build the data and the arena to hold it up.
+     */
+    mat_size = 2*BLOCK*size*NN;
+    two_dim_block_cyclic_init( &descA, TYPE, matrix_Tile,
+                               size /*nodes*/, rank /*rank*/,
+                               2*BLOCK, 1, mat_size, 1,
+                               0, 0, mat_size, 1, 1, 1, 1);
+    descA.mat = parsec_data_allocate( descA.super.nb_local_tiles *
+                                     descA.super.bsiz *
+                                     parsec_datadist_getsizeoftype(TYPE) );
+    parsec_translate_matrix_type(TYPE, &otype);
+    parsec_matrix_add2arena_rect(&arena, otype,
+                                 descA.super.mb, descA.super.nb, descA.super.mb);
+
+    /* Heat up the engine: small tasks */
+    tp = parsec_complex_deps_new( &descA, ni, nk );
+    assert( NULL != tp );
+    tp->arenas[PARSEC_complex_deps_DEFAULT_ARENA] = &arena;
+    rc = parsec_context_add_taskpool( parsec, (parsec_taskpool_t*)tp );
+    PARSEC_CHECK_ERROR(rc, "parsec_context_add_taskpool");
+
+    rc = parsec_context_start(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_start");
+
+    rc = parsec_context_wait(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_wait");
+
+    /* No priority */
+    tp = parsec_complex_deps_new( &descA, ni, nk );
+    assert( NULL != tp );
+    TIMER_START(time_elapsed);
+    tp->arenas[PARSEC_complex_deps_DEFAULT_ARENA] = &arena;
+    rc = parsec_context_add_taskpool( parsec, (parsec_taskpool_t*)tp );
+    PARSEC_CHECK_ERROR(rc, "parsec_context_add_taskpool");
+    TIMER_STOP(time_elapsed);
+    printf("DAG construction in %ld micro-sec\n", time_elapsed);
+    if( verbose >= 5 ) {
+        printf("<DartMeasurement name=\"no_pri\" type=\"numeric/double\"\n"
+               "                 encoding=\"none\" compression=\"none\">\n"
+               "%g\n"
+               "</DartMeasurement>\n",
+               (double)time_elapsed);
+    }
+    rc = parsec_context_start(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_start");
+
+    TIMER_START(time_elapsed);
+    rc = parsec_context_wait(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_wait");
+    TIMER_STOP(time_elapsed);
+    printf("DAG execution in %ld micro-sec\n", time_elapsed);
+
+    free(descA.mat);
+
+    parsec_fini( &parsec);
+
+    return 0;
+}
+
+%}

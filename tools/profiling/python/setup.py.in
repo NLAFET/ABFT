@@ -1,0 +1,135 @@
+#!/usr/bin/env python
+# build script for pbt2ptt
+# run python setup.py build_ext --inplace to build
+
+from distutils import ccompiler, util
+from distutils.core import setup
+from distutils.extension import Extension
+from Cython.Distutils import build_ext
+from Cython.Build import cythonize
+import os.path
+import sys
+import socket
+
+c_compiler = '@CMAKE_C_COMPILER@'.replace('FILEPATH=', '')
+cxx_compiler = '@CMAKE_CXX_COMPILER@'.replace('FILEPATH=', '')
+
+build_type = '@CMAKE_BUILD_TYPE@'
+
+extra_compile_args = util.split_quoted('@C_WFLAGS@')
+if c_compiler.endswith('icc'):
+    extra_compile_args.extend(['-wd47', '-static-intel'])
+# I don't know how to automatically check for this but on some
+# systems the python, and therefore cython, are build with the
+# -f-stack-protector on. If we are not using the same flag, importing
+# the .so will be impossible due to the lack of the symbols related
+# to the stack protector. In this case one must enable the line
+# below.
+extra_compile_args.extend(['-fno-stack-protector'])
+
+# libs = ['irc', 'imf', 'parsec-base']
+libs = ['parsec-base'] #+ '@CMAKE_C_IMPLICIT_LINK_LIBRARIES@'.split(';')
+lib_dirs = (['@PROJECT_BINARY_DIR@/parsec']) # +
+#            '@CMAKE_C_IMPLICIT_LINK_DIRECTORIES@'.split(';') )
+run_dirs = [] # '@CMAKE_C_IMPLICIT_LINK_DIRECTORIES@'.split(';')
+package_dir='@CMAKE_CURRENT_BINARY_DIR@'
+
+debuggeron = False
+if 'Debug' == build_type:
+    debuggeron = True
+    extra_compile_args.append('-O0') # Overwrite the default Cython compilation flags
+
+extensions = [Extension('pbt2ptt', ['@CMAKE_CURRENT_SOURCE_DIR@/pbt2ptt.pyx',
+                                    '@CMAKE_CURRENT_SOURCE_DIR@/../dbpreader.c'],
+                         include_dirs=['@PROJECT_SOURCE_DIR@/parsec/include',
+                                       '@PROJECT_SOURCE_DIR@',
+                                       '@PROJECT_BINARY_DIR@/parsec/include',
+                                       '@PROJECT_BINARY_DIR@',
+                                       '@CMAKE_CURRENT_SOURCE_DIR@/../'],
+                         depends=['setup.py.in',
+                                  'pbt2ptt.pxd',
+                                  '@CMAKE_CURRENT_BINARY_DIR@/../dbpreader.h',
+                                  '@PROJECT_SOURCE_DIR@/parsec/parsec_binary_profiling.h',
+                                  '@PROJECT_SOURCE_DIR@/include/parsec/os-spec-timing.h'],
+                         library_dirs=lib_dirs,
+                         runtime_library_dirs=run_dirs,
+                         libraries=libs,
+                         # extra_compile_args=['@CMAKE_C_FLAGS@']
+                     )]
+
+class local_compiler_build_ext( build_ext ):
+    def build_extensions(self):
+        # manually set options on compiler
+        try:
+            self.compiler.compiler = ([c_compiler] +
+                                      self.compiler.compiler[1:] +
+                                      util.split_quoted('@CMAKE_C_FLAGS@') +
+                                      extra_compile_args
+            )
+        except:
+            pass
+
+        try:
+            self.compiler.preprocessor = ([c_compiler] +
+                                          self.compiler.preprocessor[1:]
+            )
+        except:
+            pass
+
+        try:
+            self.compiler.compiler_so = ([c_compiler] +
+                                         self.compiler.compiler_so[1:] +
+                                         util.split_quoted('@CMAKE_C_FLAGS@') +
+                                         extra_compile_args
+            )
+        except:
+            pass
+
+        try:
+            self.compiler.linker_so = ([c_compiler] +
+                                       self.compiler.linker_so[1:] +
+                                       util.split_quoted('@CMAKE_C_FLAGS@') +
+                                       extra_compile_args
+            )
+        except:
+            pass
+
+        try:
+            self.compiler.compiler_cxx = ([cxx_compiler] +
+                                          self.compiler.compiler_cxx[1:] +
+                                          util.split_quoted('@CMAKE_C_FLAGS@') +
+                                          extra_compile_args
+            )
+        except:
+            pass
+
+        # print('compiler is ' + str(self.compiler.__dict__))
+        build_ext.build_extensions(self)
+
+def distutils_dir_name(dname):
+    try:
+        import sysconfig
+        """Returns the name of a distutils build directory"""
+        f = "{dirname}.{platform}-{version[0]}.{version[1]}"
+        return f.format(dirname=dname,
+                        platform=sysconfig.get_platform(),
+                        version=sys.version_info)
+    except ImportError as e:
+        print(e)
+        print('Without the sysconfig module, the bash environment setup script may not work.')
+        print('A modern Python installation with the full distutils package is recommended.')
+        return 'LIB_DIR'
+
+setup(
+    name = 'PaRSEC Binary Trace Interface',
+    version='@PACKAGE_VERSION@',
+    description='parses and converts the PaRSEC Binary Trace format into a pandas-based Python tabular format',
+    url='http://icl.cs.utk.edu/parsec/',
+    package_dir={ '': package_dir },
+    cmdclass = {'build_ext': local_compiler_build_ext},
+    ext_modules = cythonize(extensions)
+)
+
+install_dir = distutils_dir_name('lib')
+print('Installed Python Trace Tables module to', install_dir)
+

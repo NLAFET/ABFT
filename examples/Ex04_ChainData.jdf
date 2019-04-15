@@ -1,0 +1,167 @@
+extern "C" %{
+
+/**
+ * This example shows how to use a user data, and how to modify it.
+ *    data_of()
+ *    parsec_data_create()
+ *    parsec_data_destroy()
+ */
+
+#include "parsec.h"
+
+%}
+
+mydata  [ type="parsec_data_collection_t*" ]
+NB      [ type="int" ]
+
+Task(k)
+
+k = 0 .. NB
+
+: mydata( k )
+
+/**
+ * The task now reads a data from the memory at a position described by the descriptor.
+ * WARNING: The direct memory access read and/or write must always be colocated
+ * with the task placement.
+ */
+RW  A <- (k == 0)  ? mydata( k ) : A Task( k-1 )
+      -> (k == NB) ? mydata( k ) : A Task( k+1 )
+
+BODY
+{
+    int *Aint = (int*)A;
+    int rank;
+    *Aint += 1;
+
+    MPI_Comm_rank( MPI_COMM_WORLD, &rank );
+    printf("I am element %d in the chain computed on node %d\n", *Aint, rank );
+}
+END
+
+extern "C" %{
+
+static uint32_t
+rank_of(parsec_data_collection_t *desc, ...)
+{
+    int k;
+    va_list ap;
+
+    va_start(ap, desc);
+    k = va_arg(ap, int);
+    va_end(ap);
+
+    return k % desc->nodes;
+}
+
+static int32_t
+vpid_of(parsec_data_collection_t *desc, ...)
+{
+    (void)desc;
+    return 0;
+}
+
+static parsec_data_key_t
+data_key(parsec_data_collection_t *desc, ...)
+{
+    int k;
+    va_list ap;
+    (void)desc;
+    va_start(ap, desc);
+    k = va_arg(ap, int);
+    va_end(ap);
+    return (uint64_t)k;
+}
+
+/**
+ * The funtion data_of is similar to rank_of instead that it returns the
+ * parsec_data_t structure that taskpool the single piece of data corresponding to
+ * the given indexes.
+ * Each piece of data that will go through the engine needs to have it's own
+ * parsec_data_t stucture that stores its status information about it
+ * (See further down, how to create the parsec_data_t)
+ *
+ * In this example, we consider that we have only one area of memory per node,
+ * so we always return the global parsec_data_t structure that has been
+ * initialized on the current node.
+ */
+static parsec_data_t *ddata_mycounter = NULL;
+
+static parsec_data_t *
+data_of(parsec_data_collection_t *desc, ...)
+{
+    (void)desc;
+    return ddata_mycounter;
+}
+
+int main(int argc, char *argv[])
+{
+    parsec_context_t* parsec;
+    int rc;
+    int rank, world;
+    parsec_data_collection_t mydata;
+    parsec_Ex04_ChainData_taskpool_t *tp;
+    int mycounter;
+
+#if defined(PARSEC_HAVE_MPI)
+    {
+        int provided;
+        MPI_Init_thread(&argc, &argv, MPI_THREAD_SERIALIZED, &provided);
+    }
+    MPI_Comm_size(MPI_COMM_WORLD, &world);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+#else
+    world = 1;
+    rank = 0;
+#endif
+
+    parsec = parsec_init(-1, &argc, &argv);
+
+    /**
+     * Let's create the local data (mycounter), and the parsec_data_t associated to it
+     */
+    mycounter = 300 + rank;
+    ddata_mycounter = parsec_data_create( &ddata_mycounter, /* The parsec_data_t taskpool value   */
+                                         &mydata,          /* The descriptor associated to it */
+                                         0,                /* The data key (see later)        */
+                                         &mycounter,       /* The pointer to the data         */
+                                         sizeof(int)       /* The size of the data            */);
+
+
+    parsec_data_collection_init(&mydata, world, rank);
+    mydata.rank_of = rank_of;
+    mydata.vpid_of = vpid_of;
+    mydata.data_key = data_key;
+
+    /**
+     * Here we update the data_of pointer from the descriptor
+     */
+    mydata.data_of = data_of;
+
+    tp = parsec_Ex04_ChainData_new(&mydata, 20);
+
+    parsec_arena_construct(tp->arenas[PARSEC_Ex04_ChainData_DEFAULT_ARENA],
+                           sizeof(int), PARSEC_ARENA_ALIGNMENT_SSE,
+                           parsec_datatype_int_t );
+
+    rc = parsec_context_add_taskpool( parsec, (parsec_taskpool_t*)tp );
+    PARSEC_CHECK_ERROR(rc, "parsec_context_add_taskpool");
+    rc = parsec_context_start(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_start");
+    rc = parsec_context_wait(parsec);
+    PARSEC_CHECK_ERROR(rc, "parsec_context_wait");
+
+    parsec_taskpool_free((parsec_taskpool_t*)tp);
+
+    parsec_data_destroy( ddata_mycounter );
+    parsec_data_collection_destroy( &mydata );
+
+    parsec_fini(&parsec);
+#if defined(PARSEC_HAVE_MPI)
+    MPI_Finalize();
+#endif
+
+    return 0;
+}
+
+%}

@@ -1,0 +1,307 @@
+extern "C" %{
+/*
+ * Copyright (c) 2013-2018 The University of Tennessee and The University
+ *                         of Tennessee Research Foundation.  All rights
+ *                         reserved.
+ */
+#include "parsec/data_distribution.h"
+#include "parsec/data_dist/matrix/matrix.h"
+#include "parsec/data.h"
+#include "parsec/utils/mca_param.h"
+#include "parsec/arena.h"
+#include <stdlib.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#define SWAP(_x, _y) {int t = _x; _x = _y; _y = t;}
+#define SET(_a,_b,_c,_d,_e, _A) {_A[0]=_a; _A[1]=_b; _A[2]=_c; _A[3]=_d; _A[4]=_e;}
+
+int sort_5(int *elems){
+    int a,b,c,d,e;
+
+    a = elems[0];
+    b = elems[1];
+    c = elems[2];
+    d = elems[3];
+    e = elems[4];
+
+    if(b > a){ // a>=b
+        SWAP(a,b);
+    }
+
+    if(d > c){ // c>=d
+        SWAP(c,d);
+    }
+
+    if(c > a){ // a>=c>=d
+        /* if "c>a" then we had c>a>=b, so after the swaps we will have a>c>=d */
+        SWAP(a,c);
+        SWAP(b,d);
+    }
+
+    if(e > c){
+        if(e > a){ // e,a,c,d
+            if(b > c){     // e,a,b,c,d *
+                // we know that "max{a,c}>b" already
+                SET(e,a,b,c,d, elems);
+                return 0;
+            }else{
+                if(b > d){ // e,a,c,b,d **
+                    SET(e,a,c,b,d, elems);
+                    return 1;
+                }else{     // e,a,c,d,b **
+                    SET(e,a,c,d,b, elems);
+                    return 2;
+                }
+            }
+        }else{ // a,e,c,d
+            if(b > c){
+                if(b > e){ // a,b,e,c,d **
+                    SET(a,b,e,c,d, elems);
+                    return 3;
+                }else{     // a,e,b,c,d **
+                    SET(a,e,b,c,d, elems);
+                    return 4;
+                }
+            }else{
+                if(b > d){ // a,e,c,b,d **
+                    SET(a,e,c,b,d, elems);
+                    return 5;
+                }else{     // a,e,c,d,b **
+                    SET(a,e,c,d,b, elems);
+                    return 6;
+                }
+            }
+        }
+    }else{
+        if(e > d){ // a,c,e,d
+            if(b > e){
+                if(b > c){ // a,b,c,e,d **
+                    SET(a,b,c,e,d, elems);
+                    return 7;
+                }else{     // a,c,b,e,d **
+                    SET(a,c,b,e,d, elems);
+                    return 8;
+                }
+            }else{
+                if(b > d){ // a,c,e,b,d **
+                    SET(a,c,e,b,d, elems);
+                    return 9;
+                }else{     // a,c,e,d,b **
+                    SET(a,c,e,d,b, elems);
+                    return 10;
+                }
+            }
+        }else{ // a,c,d,e
+            if(b > d){
+                if(b > c){ // a,b,c,d,e
+                    SET(a,b,c,d,e, elems);
+                    return 11;
+                }else{     // a,c,b,d,e
+                    SET(a,c,b,d,e, elems);
+                    return 12;
+                }
+            }else{
+                if(b > e){ // a,c,d,b,e
+                    SET(a,c,d,b,e, elems);
+                    return 13;
+                }else{     // a,c,d,e,b
+                    SET(a,c,d,e,b, elems);
+                    return 14;
+                }
+            }
+        }
+    }
+    return -1;
+}
+
+/* functions needed for the reduction */
+size_t tree_height(int NT){
+    size_t i;
+    for(i=0; i<8*sizeof(NT); i++){
+        if( (1<<i) >= NT )
+            return i;
+    }
+    assert(0);
+    return 0;
+}
+
+int tree_width_at_level(int lvl, int NT){
+    int w,i;
+
+    w = NT;
+    for(i=0; i<lvl; i++){
+        w = (w+1)/2;
+    }
+
+    return w;
+}
+
+int compute_cleanup_size(int lvl, int NB, int NT){
+    int w,j,nxt_size;
+
+    w = NT;
+    nxt_size = NB;
+    for(j=0; j<lvl; j++){
+        if( 0 == w%2 )
+            nxt_size += NB*(1<<j);
+
+        w = (w+1)/2;
+    }
+
+    return nxt_size;
+
+}
+
+int compute_data_size(int lvl, int i, int NB, int NT){
+    int w;
+    w = tree_width_at_level(lvl, NT);
+
+    if( lvl < 0 )
+        return NB;
+
+    /* This can happen and it's not an error, as long as the caller does not use the result */
+    if( i > w-1 )
+        return -1;
+
+    if( i == w-1 ){
+        return compute_cleanup_size(lvl, NB, NT);
+    }else{
+        return NB*(1<<lvl);
+    }
+}
+
+#define MY_TYPE parsec_datatype_int_t
+%}
+
+dataA      [type = "struct parsec_tiled_matrix_dc_t *"]
+NB         [type = int]
+NT         [type = int]
+
+/*
+ *
+ */
+INIT_DATA(i)
+  i = 0..NT-1
+
+  : dataA(i,0)
+
+  RW A <- dataA(i,0)
+       -> A SORT(i)
+
+BODY
+   int rank=(__parsec_tp->super.super.context)->my_rank;
+   pid_t pid = getpid();
+
+   for(int j=0; j<5; j++){
+       *(((int *)A)+j) = rank*10 + pid/100 + random()%1048576;
+   }
+
+END
+
+
+
+/*
+ *
+ */
+SORT(i)
+  i = 0..NT-1
+
+  : dataA(i,0)
+
+  RW A <- A INIT_DATA(i)
+       -> A REDUCE(0, i) [ type= DEFAULT layout= MY_TYPE count= NB ]
+
+BODY
+   int type;
+
+   type = sort_5((int *)A);
+   assert( type >= 0 ); (void)type;
+
+END
+
+
+
+/*
+ *
+ */
+REDUCE(lvl,i)
+  // Execution space
+  h = %{ return tree_height(NT); %}
+  lvl  = 0..h
+  width = %{ return tree_width_at_level(lvl, NT); %}
+  i  = 0..width-1
+
+  prnt_width = %{ return tree_width_at_level(lvl-1, NT); %}
+
+  A_data_size  = %{ return compute_data_size(lvl-1, 2*i,   NB, NT); %}
+  /* We will get "-1" as the answer if there is no B parent, but we will not use it */
+  B_data_size  = %{ return compute_data_size(lvl-1, 2*i+1, NB, NT); %}
+
+  data_size  = %{ return compute_data_size(lvl, i, NB, NT); %}
+
+  : dataA(i,0)
+
+  READ  A <- (lvl==0) ? A SORT(i)             [ type= DEFAULT layout= MY_TYPE count= NB ]
+          <- (lvl>0)  ? C REDUCE(lvl-1, i*2)  [ type= DEFAULT layout= MY_TYPE count= A_data_size ]
+
+  READ  B <- (lvl==0) ? NULL
+          <- (lvl>0) && (prnt_width-1<=i*2) ? NULL
+          <- (lvl>0) && (prnt_width-1> i*2) ? C REDUCE(lvl-1, i*2+1) [ type= DEFAULT layout= MY_TYPE count= B_data_size ]
+
+  WRITE C -> (lvl<h) && (0==i%2) ? A REDUCE(lvl+1, i/2)  [ type= DEFAULT layout= MY_TYPE count= data_size ]
+          -> (lvl<h) && (0!=i%2) ? B REDUCE(lvl+1, i/2)  [ type= DEFAULT layout= MY_TYPE count= data_size ]
+          -> (lvl==h) ? C RESULT(0)                      [ type= DEFAULT layout= MY_TYPE count= data_size ]
+
+BODY
+
+  int *Aptr, *Cptr;
+  Aptr = (int *)A;
+  Cptr = (int *)C;
+
+  // If there was no B
+  if( (lvl==0) || ((lvl>0) && (prnt_width-1<=i*2)) ){
+      assert(A_data_size == data_size);
+      memcpy(Cptr, Aptr, data_size*sizeof(int));
+  }else{
+      int jc,ja,jb;
+      int *Bptr;
+      Bptr = (int *)B;
+
+      ja=jb=0;
+      for(jc=0; jc<data_size; jc++){
+          if( (ja < A_data_size) && ((Aptr[ja] > Bptr[jb]) || (jb == B_data_size)) ){
+              Cptr[jc] = Aptr[ja];
+              ja++;
+          }else{
+              Cptr[jc] = Bptr[jb];
+              jb++;
+          }
+      }
+      assert( (ja==A_data_size) && (jb==B_data_size) && ((A_data_size+B_data_size) == data_size) );
+  }
+
+END
+
+
+/*
+ *
+ */
+RESULT(j)
+    j = 0..0
+    h = %{ return tree_height(NT); %}
+
+    : dataA(0, 0)
+
+    READ C <- C REDUCE(h, 0)
+
+BODY
+  int jc;
+  int *Cptr = (int *)C;
+
+  if( 0==((__parsec_tp->super.super.context)->my_rank) ){
+      for(jc=0; jc<NT*NB; jc++){
+          printf("%d\n",Cptr[jc]);
+      }
+  }
+END
